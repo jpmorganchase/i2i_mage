@@ -1,7 +1,7 @@
 import os
 import glob
 import argparse
-from cleanfid import fid
+from i2i_cleanfid import fid
 from metric import inception_score, BaseDataset
 
 if __name__ == '__main__':
