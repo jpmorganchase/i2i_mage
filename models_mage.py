@@ -154,6 +154,7 @@ class MaskedGenerativeEncoderViT(nn.Module):
                  vqgan_ckpt_path='vqgan_jax_strongaug.ckpt'):
         super().__init__()
 
+        self.num_grid_rows = int(img_size/patch_size)
         # --------------------------------------------------------------------------
         # VQGAN specifics
         config = OmegaConf.load('config/vqgan.yaml').model
@@ -181,7 +182,7 @@ class MaskedGenerativeEncoderViT(nn.Module):
 
         # --------------------------------------------------------------------------
         # MAGE encoder specifics
-        dropout_rate = 0.1
+        dropout_rate = 0.0
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
@@ -255,7 +256,59 @@ class MaskedGenerativeEncoderViT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward_encoder(self, x):
+    def forward_encoder(self, x, token_drop_mask_raw=None, token_all_mask_raw=None):
+        # tokenization
+        with torch.no_grad():
+            z_q, _, token_tuple = self.vqgan.encode(x)
+        # print('encoding images')
+        
+        _, _, token_indices = token_tuple
+        token_indices = token_indices.reshape(z_q.size(0), -1)
+        gt_indices = token_indices.clone().detach().long()
+
+        if token_drop_mask_raw is None:
+            # masking
+            bsz, seq_len = token_indices.size()
+            mask_ratio_min = self.mask_ratio_min
+            mask_rate = self.mask_ratio_generator.rvs(1)[0]
+
+            num_dropped_tokens = int(np.ceil(seq_len * mask_ratio_min))
+            num_masked_tokens = int(np.ceil(seq_len * mask_rate))
+
+            # it is possible that two elements of the noise is the same, so do a while loop to avoid it
+            while True:
+                noise = torch.rand(bsz, seq_len, device=x.device)  # noise in [0, 1]
+                sorted_noise, _ = torch.sort(noise, dim=1)  # ascend: small is remove, large is keep
+                cutoff_drop = sorted_noise[:, num_dropped_tokens-1:num_dropped_tokens]
+                cutoff_mask = sorted_noise[:, num_masked_tokens-1:num_masked_tokens]
+                token_drop_mask_raw = (noise <= cutoff_drop).float()
+                token_all_mask_raw = (noise <= cutoff_mask).float()
+                if token_drop_mask_raw.sum() == bsz*num_dropped_tokens and token_all_mask_raw.sum() == bsz*num_masked_tokens:
+                    break
+                else:
+                    print("Rerandom the noise!")
+        token_indices[token_all_mask_raw.nonzero(as_tuple=True)] = self.mask_token_label
+        token_indices = torch.cat([torch.zeros(token_indices.size(0), 1).cuda(device=token_indices.device), token_indices], dim=1)
+        token_indices[:, 0] = self.fake_class_label
+        token_drop_mask = torch.cat([torch.zeros(token_indices.size(0), 1).cuda(), token_drop_mask_raw], dim=1)
+        token_all_mask = torch.cat([torch.zeros(token_indices.size(0), 1).cuda(), token_all_mask_raw], dim=1)
+        token_indices = token_indices.long()
+
+        input_embeddings = self.token_emb(token_indices)
+        bsz, seq_len, emb_dim = input_embeddings.shape
+
+        # dropping
+        token_keep_mask = 1 - token_drop_mask
+        input_embeddings_after_drop = input_embeddings[token_keep_mask.nonzero(as_tuple=True)].reshape(bsz, -1, emb_dim)
+
+        # apply Transformer blocks
+        x = input_embeddings_after_drop
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        return x, gt_indices, token_drop_mask, token_all_mask, token_indices, token_drop_mask_raw, token_all_mask_raw
+
+    def forward_encoder_mask(self, x, mask_ratio=0.5, mode='center'):
         # tokenization
         with torch.no_grad():
             z_q, _, token_tuple = self.vqgan.encode(x)
@@ -271,22 +324,19 @@ class MaskedGenerativeEncoderViT(nn.Module):
 
         num_dropped_tokens = int(np.ceil(seq_len * mask_ratio_min))
         num_masked_tokens = int(np.ceil(seq_len * mask_rate))
+        # print(bsz, seq_len, mask_ratio_min, mask_rate, num_dropped_tokens, num_masked_tokens)
 
-        # it is possible that two elements of the noise is the same, so do a while loop to avoid it
-        while True:
-            noise = torch.rand(bsz, seq_len, device=x.device)  # noise in [0, 1]
-            sorted_noise, _ = torch.sort(noise, dim=1)  # ascend: small is remove, large is keep
-            cutoff_drop = sorted_noise[:, num_dropped_tokens-1:num_dropped_tokens]
-            cutoff_mask = sorted_noise[:, num_masked_tokens-1:num_masked_tokens]
-            token_drop_mask = (noise <= cutoff_drop).float()
-            token_all_mask = (noise <= cutoff_mask).float()
-            if token_drop_mask.sum() == bsz*num_dropped_tokens and token_all_mask.sum() == bsz*num_masked_tokens:
-                break
-            else:
-                print("Rerandom the noise!")
-        # print(mask_rate, num_dropped_tokens, num_masked_tokens, token_drop_mask.sum(dim=1), token_all_mask.sum(dim=1))
-        token_indices[token_all_mask.nonzero(as_tuple=True)] = self.mask_token_label
-        # print("Masekd num token:", torch.sum(token_indices == self.mask_token_label, dim=1))
+        if mode=='center':
+            mask_array = np.zeros((self.num_grid_rows, self.num_grid_rows))
+            start_row = int(0.5*(1.0-mask_ratio))
+            end_row = int(0.5*(1.0+mask_ratio))
+            mask_array[start_row:end_row, start_row:end_row] = 1.0
+            token_drop_mask = torch.flatten(torch.tensor(mask_array)).unsqueeze(0).cuda()
+            mask_array[start_row-1:end_row+1, start_row-1:end_row+1] = 1.0
+            token_all_mask = torch.flatten(torch.tensor(mask_array)).unsqueeze(0).cuda()
+            # print(mask_rate, num_dropped_tokens, num_masked_tokens, token_drop_mask.sum(dim=1), token_all_mask.sum(dim=1))
+            token_indices[token_all_mask.nonzero(as_tuple=True)] = self.mask_token_label
+            # print("Masekd num token:", torch.sum(token_indices == self.mask_token_label, dim=1))
 
         # concate class token
         token_indices = torch.cat([torch.zeros(token_indices.size(0), 1).cuda(device=token_indices.device), token_indices], dim=1)
@@ -294,6 +344,16 @@ class MaskedGenerativeEncoderViT(nn.Module):
         token_drop_mask = torch.cat([torch.zeros(token_indices.size(0), 1).cuda(), token_drop_mask], dim=1)
         token_all_mask = torch.cat([torch.zeros(token_indices.size(0), 1).cuda(), token_all_mask], dim=1)
         token_indices = token_indices.long()
+        # print(token_drop_mask)
+        # print(token_all_mask)
+        # print(token_all_mask-token_drop_mask)
+        # print(token_indices)
+
+        # print(token_drop_mask.size())
+        # print(token_all_mask.size())
+        # print(token_all_mask-token_drop_mask)
+        # print(token_indices.size())
+        # exit()
         # bert embedding
         input_embeddings = self.token_emb(token_indices)
         # print("Input embedding shape:", input_embeddings.shape)
@@ -312,6 +372,7 @@ class MaskedGenerativeEncoderViT(nn.Module):
         # print("Encoder representation shape:", x.shape)
 
         return x, gt_indices, token_drop_mask, token_all_mask
+
 
     def forward_decoder(self, x, token_drop_mask, token_all_mask):
         # embed tokens
@@ -352,10 +413,61 @@ class MaskedGenerativeEncoderViT(nn.Module):
         loss = (loss * mask[:, 1:]).sum() / mask[:, 1:].sum()  # mean loss on removed patches
         return loss
 
-    def forward(self, imgs):
-        latent, gt_indices, token_drop_mask, token_all_mask = self.forward_encoder(imgs)
+    def forward_weighted_loss(self, gt_indices, logits, mask, labels, forget_alpha):
+        bsz, seq_len = gt_indices.size()
+        # print(gt_indices, torch.max(gt_indices), torch.mean(gt_indices.float()), torch.std(gt_indices.float()), torch.min(gt_indices))
+        label = torch.where(labels<100, -1.0, 1.0).to(gt_indices.device)
+
+        # x_after_pad = torch.where(token_all_mask.unsqueeze(-1).bool(), mask_tokens, x_after_pad)
+        # tmp = labels>0
+        # retain_idx = tmp.nonzero()
+        # tmp = labels<0
+        # forget_idx = tmp.nonzero()
+        # # logits and mask are with seq_len+1 but gt_indices is with seq_len
+        loss = self.criterion(logits[:, 1:, :self.codebook_size].reshape(bsz*seq_len, -1), gt_indices.reshape(bsz*seq_len))
+        loss = loss.reshape(bsz, seq_len)
+
+        retain_loss = (loss * mask[:, 1:]*( (1.0+label[:, None])*0.5 )).sum() / mask[:, 1:].sum()  # mean loss on removed patches
+        forget_loss = (loss * mask[:, 1:]*( (1.0-label[:, None])*0.5 )).sum() / mask[:, 1:].sum()  # mean loss on removed patches
+        loss = retain_loss - forget_alpha*forget_loss
+        return loss, retain_loss, forget_loss
+
+    def forward_weighted_loss_noise_label(self, gt_indices, logits, mask, labels, forget_alpha):
+        bsz, seq_len = gt_indices.size()
+        label = torch.where(labels<100, -1.0, 1.0).to(gt_indices.device)
+
+        noise_gt_indices = torch.clamp(torch.randn(bsz, seq_len).to(gt_indices.device)*torch.std(gt_indices.float())+torch.mean(gt_indices.float()), 0, 1023).round().long()
+
+        retain_loss = self.criterion(logits[:, 1:, :self.codebook_size].reshape(bsz*seq_len, -1), gt_indices.reshape(bsz*seq_len)).reshape(bsz, seq_len)
+        forget_loss = self.criterion(logits[:, 1:, :self.codebook_size].reshape(bsz*seq_len, -1), noise_gt_indices.reshape(bsz*seq_len)).reshape(bsz, seq_len)
+
+        retain_loss = (retain_loss * mask[:, 1:]*( (1.0+label[:, None])*0.5 )).sum() / mask[:, 1:].sum()  # mean loss on removed patches
+        forget_loss = (forget_loss * mask[:, 1:]*( (1.0-label[:, None])*0.5 )).sum() / mask[:, 1:].sum()  # mean loss on removed patches
+        loss = retain_loss + forget_alpha*forget_loss
+        return loss, retain_loss, forget_loss
+
+
+    def forward(self, imgs, labels=None, forget_alpha=0.0, return_logits = False, ratio=None, train_encoder=False, token_drop_mask_raw=None, token_all_mask_raw=None, use_noise=False):
+        # print('forward images')
+        if ratio is not None:
+            latent, gt_indices, token_drop_mask, token_all_mask, token_indices, token_drop_mask_raw, token_all_mask_raw = self.forward_encoder_mask(imgs, ratio)
+        else:
+            latent, gt_indices, token_drop_mask, token_all_mask, token_indices, token_drop_mask_raw, token_all_mask_raw = self.forward_encoder(imgs, token_drop_mask_raw, token_all_mask_raw)
+        if train_encoder:
+            return latent, gt_indices, token_drop_mask, token_all_mask, token_indices, token_drop_mask_raw, token_all_mask_raw
         logits = self.forward_decoder(latent, token_drop_mask, token_all_mask)
-        loss = self.forward_loss(gt_indices, logits, token_all_mask)
+
+        if return_logits:
+            return logits, token_drop_mask_raw, token_all_mask_raw 
+
+        if labels is None:
+            loss = self.forward_loss(gt_indices, logits, token_all_mask)
+        else:
+            if use_noise:
+                loss, retain_loss, forget_loss = self.forward_weighted_loss_noise_label(gt_indices, logits, token_all_mask, labels, forget_alpha)
+            else:
+                loss, retain_loss, forget_loss = self.forward_weighted_loss(gt_indices, logits, token_all_mask, labels, forget_alpha)
+            return loss, imgs, token_all_mask, retain_loss, forget_loss
         return loss, imgs, token_all_mask
 
 

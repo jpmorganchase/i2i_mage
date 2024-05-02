@@ -1,191 +1,129 @@
-# MAGE PyTorch Implementation
 
-<p align="center">
-  <img src="figures/method.png" width="720">
-</p>
+We modified this repo to reproduce the experiments for the paper <a href="https://openreview.net/pdf?id=9hjVoPWPnh">Machine Unlearning for Image-to-Image Generative Models</a> (ICLR 2024).
 
-This is a PyTorch/GPU re-implementation of the paper 
-<a href="https://arxiv.org/abs/2211.09117">MAGE: MAsked Generative Encoder to Unify Representation Learning and Image Synthesis</a> (to appear in CVPR 2023):
+You shall run the code in the current dir: `i2i_mage/`
 
-```
-@article{li2022mage,
-  title={MAGE: MAsked Generative Encoder to Unify Representation Learning and Image Synthesis},
-  author={Li, Tianhong and Chang, Huiwen and Mishra, Shlok Kumar and Zhang, Han and Katabi, Dina and Krishnan, Dilip},
-  journal={arXiv preprint arXiv:2211.09117},
-  year={2022}
-}
-```
+# Setup
 
-MAGE is a unified framework for both generative modeling and representation
-learning, achieving SOTA results in both class-unconditional image generation
-and linear probing on ImageNet-1K.
-<p align="center">
-  <img src="figures/result.png" width="360">
-</p>
 
-A large portion of codes in this repo is based on <a href="https://github.com/facebookresearch/mae">MAE</a> and <a href="https://github.com/CompVis/taming-transformers">VQGAN</a>.
-The original implementation was in JAX/TPU.
+### CKPT
+Download the pretrained model from [G-Drive](https://drive.google.com/file/d/1Q6tbt3vF0bSrv5sPrjpFu8ksG3vTsVX2/view). 
 
-## Preparation
+Beside, please download the pretrained VQ-GAN model [G-Drive](https://drive.google.com/file/d/13S_unB87n6KKuuMdyMnyExW0G1kplTbP/view).
 
-### Dataset
-Download [ImageNet](http://image-net.org/download) dataset, and place it in your `IMAGENET_DIR`.
+You can download them and put them under `pretrained`.
 
-### Installation
+# Usage
 
-A suitable [conda](https://conda.io/) environment named `mage` can be created and activated with:
+### **Ours Approach**
+Dataset options:
+- --retainset_ratio: the ratio of the number of **REAL** retain samples [NO PROXY] vs. the number of forget samples. 
+- --use_coco: use COCO as the proxy of retain set or not
+  - if not: will use the remaining 800 classess from imagenet-1k as the proxy retain set
+- --opendata_to_forget_ratio: the ratio of the number of **TOTAL** retain samples [REAL+PROXY] vs. the number of forget samples.
+  - Note if, not equal `1`, will oversample to make them balanced
+- --num_image_per_class: number of images per class for the forget set.
 
-```
-conda env create -f environment.yaml
-conda activate mage
-```
+|Approach|--retainset_ratio|--use_coco|--opendata_to_forget_ratio|
+|-|-|-|-|
+|  **Use REAL retain ONLY**  | >0   |  0  |  0  | 
+|  **Use COCO only**  |  0  |  1  |  >0  |
+|  **Use rest 800 classes from IN-1K only**  |  0  |  0  |  >0  |
+|  **Use COCO +REAL retain**  |  >0  |  1  |  >0  |
+|  **Use rest 800 classes from IN-1K +REAL retain**  |  >0  |  0  |  >0  |
 
-Download the code
-```
-git clone https://github.com/LTH14/mage.git
-cd mage
-```
-Use <a href="https://drive.google.com/file/d/13S_unB87n6KKuuMdyMnyExW0G1kplTbP/view?usp=sharing">this link</a>
-to download the pre-trained VQGAN tokenzier and put it in the mage directory.
 
-## Usage
+- example:
+   - `python -m torch.distributed.launch --nproc_per_node=4 main_unlearn.py --resume pretrained/mage-vitb-1600.pth --blr 0.0001 --forget_alpha 0.2`
 
-### Pre-training
+### **Run other baseline methods **
+Define `loss_type` in the following code
+`python -m torch.distributed.launch --nproc_per_node=4 main_baseline.py --resume pretrained/mage-vitb-1600.pth --blr 0.0001 --forget_alpha 0.2 --loss_type $LOSS_TYPE`
 
-To pre-train a MAGE ViT-B model with 4096 batch size using 8 servers with 8 V100 GPUs per server:
-```
-python -m torch.distributed.launch --node_rank=0 --nproc_per_node=8 --nnodes=8 \
---master_addr="${MASTER_SERVER_ADDRESS}" --master_port=12344 \
-main_pretrain.py \
---batch_size 64 \
---model mage_vit_base_patch16 \
---mask_ratio_min 0.5 --mask_ratio_max 1.0 \
---mask_ratio_mu 0.55 --mask_ratio_std 0.25 \
---epochs 1600 \
---warmup_epochs 40 \
---blr 1.5e-4 --weight_decay 0.05 \
---output_dir ${OUTPUT_DIR} \
---data_path ${IMAGENET_DIR} \
---dist_url tcp://${MASTER_SERVER_ADDRESS}:2214
-```
+    - Retain Label: $LOSS_TYPE == 'learn_others'
+    - MAX Loss: $LOSS_TYPE =='max_full_model_loss'
+    - Random Encoder: $LOSS_TYPE == 'encoder_noise'
+    - Noise Label: $LOSS_TYPE == 'full_model_noise'
+- Example of MAX Loss:
+  - `python -m torch.distributed.launch --nproc_per_node=4 main_baseline.py --resume pretrained/mage-vitb-1600.pth --blr 0.0001 --forget_alpha 0.2 --loss_type full_model_noise`
 
-The following table provides the performance and weights of the
-pre-trained checkpoints used in the paper, converted from JAX/TPU
-to PT/GPU:
-<table><tbody>
-<!-- START TABLE -->
-<!-- TABLE HEADER -->
-<th valign="bottom"></th>
-<th valign="bottom">ViT-Base</th>
-<th valign="bottom">ViT-Large</th>
-<!-- TABLE BODY -->
-<tr><td align="left">Checkpoint</td>
-<td align="center"><a href="https://drive.google.com/file/d/1Q6tbt3vF0bSrv5sPrjpFu8ksG3vTsVX2/view?usp=sharing">Google Drive</a></td>
-<td align="center"><a href="https://drive.google.com/file/d/15xBPa8EIa0IRUiRYtXiYOC9JZVyMIFrB/view?usp=sharing">Google Drive</a></td>
-</tr>
-</tr>
-<tr><td align="left">Class-unconditional Generation FID </td>
-<td align="center">11.1</td>
-<td align="center">9.10</td>
-</tr>
-</tr>
-<tr><td align="left">Class-unconditional Generation IS </td>
-<td align="center">81.2</td>
-<td align="center">105.1</td>
-</tr>
-<tr><td align="left">Linear Probing Top-1 Accuracy</td>
-<td align="center">74.7%</td>
-<td align="center">78.9%</td>
-<tr><td align="left">Fine-tuning Top-1 Accuracy</td>
-<td align="center">82.5% <a href="https://drive.google.com/file/d/1q-q-L9x7w9a5Q4aEfFrdRQUpjM-0kAsS/view?usp=sharing">Checkpoint</a></td>
-<td align="center">83.9% <a href="https://drive.google.com/file/d/13w0LOnJ-MnyI2dBaGEkmdsf5xik2PUS6/view?usp=sharing">Checkpoint</a></td>
-</tr>
-</tbody></table>
+# Test
+### **Generate images**
 
-### Linear Probing
+**Inpaint**
 
-To perform linear probing on pre-trained MAGE model using 4 servers with 8 V100 GPUs per server:
-```
-python -m torch.distributed.launch --node_rank=0 --nproc_per_node=8 --nnodes=4 \
---master_addr="${MASTER_SERVER_ADDRESS}" --master_port=12344 \
-main_linprobe.py \ 
---batch_size 128 \
---model vit_base_patch16 \
---global_pool \
---finetune ${PRETRAIN_CHKPT} \
---epochs 90 \
---blr 0.1 \
---weight_decay 0.0 \
---output_dir ${OUTPUT_DIR} \
---data_path ${IMAGENET_DIR} \
---dist_eval --dist_url tcp://${MASTER_SERVER_ADDRESS}:6311
-```
+CUDA_VISIBLE_DEVICES=0 python testpaint.py --task inpaint --dataset img --ckpt_path $CKPT_PATH
 
-For ViT-L, set `--blr 0.05`.
+**Outpaint**
 
-### Fine-tuning
+CUDA_VISIBLE_DEVICES=1 python testpaint.py --task outpaint --dataset img --ckpt_path $CKPT_PATH
 
-To perform fine-tuning with pre-trained ViT-B model using 4 servers with 8 V100 GPUs per server:
+
+- Example: test the model before unlearning:
 
 ```
-python -m torch.distributed.launch --node_rank=0  --nproc_per_node=8 --nnodes=4 \
---master_addr="${MASTER_SERVER_ADDRESS}" --master_port=12344 \
-main_finetune.py \
---batch_size 32 \
---model vit_base_patch16 \
---global_pool \
---finetune ${PRETRAIN_CHKPT} \
---epochs 100 \
---blr 2.5e-4 --layer_decay 0.65 --interpolation bicubic \
---weight_decay 0.05 --drop_path 0.1 --reprob 0 --mixup 0.8 --cutmix 1.0 \
---output_dir ${OUTPUT_DIR} \
---data_path ${IMAGENET_DIR} \
---dist_eval --dist_url tcp://${MASTER_SERVER_ADDRESS}:6311
+CUDA_VISIBLE_DEVICES=0 python testpaint.py --task outpaint --dataset img --ckpt_path pretrained/mage-vitb-1600.pth
+CUDA_VISIBLE_DEVICES=1 python testpaint.py --task inpaint --dataset img --ckpt_path pretrained/mage-vitb-1600.pth
 ```
 
-For ViT-L, set `--epochs 50 --layer_decay 0.75 --drop_path 0.2`.
+### **Compute FID and IS**
+Note: the installtion of FID:
 
-### Class Unconditional Generation
 
-To perform class unconditional generation with pre-trained MAGE model using a single V100 GPU:
+`python eval.py --dst $PATH_OF_GENERATED_IMG_FOLDERS --task inpaint`
 
-```
-python gen_img_uncond.py --temp 6.0 --num_iter 20 \
---ckpt ${PRETRAIN_CHKPT} --batch_size 32 --num_images 50000 \
---model mage_vit_base_patch16 --output_dir ${OUTPUT_DIR}
-```
+`python eval.py --dst $PATH_OF_GENERATED_IMG_FOLDERS --task outpaint`
 
-To quantitatively evaluate FID/IS, please first generate 256x256 
-ImageNet validation images using
+`$PATH_OF_GENERATED_IMG_FOLDERS` is the path of the tested checkpoint by `$CKPT_PATH.replace('.pth', '-inpaint/')` or `$CKPT_PATH.replace('.pth', '-outpaint/')`
 
-```
-python prepare_imgnet_val.py --data_path ${IMAGENET_DIR} --output_dir ${OUTPUT_DIR}
-```
+- Example: test the model before unlearning:
 
-Then install the <a href="https://github.com/toshas/torch-fidelity">torch-fidelity</a>
-package by
-```
-pip install torch-fidelity
-```
+	- `python eval.py --dst pretrained/mage-vitb-1600-inpaint/ --task inpaint`
+	- `python eval.py --dst pretrained/mage-vitb-1600-outpaint/ --task outpaint`
+- Results: The results for FID and IS score will be stored at `fid_is_eval_{MODE}.csv`， where `{MODE}` is `inpaint` or `outpaint`.
 
-Then use the above package to evaluate FID/IS of the images generated 
-by our models against 256x256 ImageNet validation images by 
+### **Computer CLIP score**
+
+Environment preparation:
 ```
-fidelity --gpu 0 --isc --fid --input1 ${GENERATED_IMAGES_DIR} --input2 ${IMAGENET256X256_DIR}
+wget https://huggingface.co/laion/CLIP-ViT-H-14-laion2B-s32B-b79K/resolve/main/open_clip_pytorch_model.bin
+mv open_clip_pytorch_model.bin pretrained/open_clip_vit_h_14_laion2b_s32b_b79k.bin
 ```
 
-Here are some examples of our class-unconditional generation:
-<p align="center">
-  <img src="figures/uncond-gen.png" width="480">
-</p>
+Prepare the clip embedding of original iamges:
 
-### MAGE-C
-Here we provide the pre-trained MAGE-C 
-checkpoints converted from JAX/TPU to PT/GPU: 
-<a href="https://drive.google.com/file/d/1069p6ZURt-xLFYrHfUiySQt1VCmWsun3/view?usp=sharing">ViT-B</a>,
-<a href="https://drive.google.com/file/d/1GOz8l6N-3LcUrM6a--TnBztN7NJpZ-Hp/view?usp=sharing">ViT-L</a>.
-PyTorch training script coming soon. 
+`python clip_embed.py --img_folder original --task inpaint`
 
-### Contact
+`python clip_embed.py --img_folder original --task outpaint`
 
-If you have any questions, feel free to contact me through email (tianhong@mit.edu). Enjoy!
+
+Run the generated images:
+
+`python clip_embed.py --img_folder $PATH_OF_GENERATED_IMG_FOLDERS --task inpaint`
+
+`python clip_embed.py --img_folder $PATH_OF_GENERATED_IMG_FOLDERS --task outpaint`
+
+- Example: test the model before unlearning:
+
+	- `python clip_embed.py --img_folder pretrained/mage-vitb-1600-inpaint/ --task inpaint`
+	- `python clip_embed.py --img_folder pretrained/mage-vitb-1600-outpaint/ --task outpaint`
+- Results: The results for CLIP score will be stored at `clip_cosine_{MODE}.csv`， where `{MODE}` is `inpaint` or `outpaint`.
+
+
+### **T-SNE**
+
+After CLIP, run T-SNE with embedding
+
+`python tsne_visual.py --ckpt_folder $PATH_OF_GENERATED_IMG_FOLDERS`
+
+
+
+
+
+
+
+
+
+
+
+

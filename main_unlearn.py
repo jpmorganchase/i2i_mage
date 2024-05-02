@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import json
+import copy
 import numpy as np
 import os
 import time
@@ -19,22 +20,27 @@ import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
+from util.datasets import dataset_class_img1k_only, dataset_class_img1k_coco
 
 import models_mage
 
-from engine_pretrain import train_one_epoch
+from engine_unlearn import train_one_epoch
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('MAGE pre-training', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
-                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--use_sagemaker', default=0, type=int,
+                        help='using sagemaker or not')
+    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--early_epochs', default=6, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
+    parser.add_argument('--batch_size', default=32, type=int,
+                        help='Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus')
+
 
     # Model parameters
-    parser.add_argument('--model', default='mage_vit_large_patch16', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='mage_vit_base_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
 
     parser.add_argument('--input_size', default=256, type=int,
@@ -46,13 +52,20 @@ def get_args_parser():
 
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='learning rate (absolute lr)')
-    parser.add_argument('--blr', type=float, default=1e-3, metavar='LR',
+    parser.add_argument('--blr', type=float, default=1e-4, metavar='LR',
                         help='base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
 
-    parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='epochs to warmup LR')
+
+    parser.add_argument('--forget_alpha', type=float, default=0., metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0')
+    parser.add_argument('--retain_alpha', type=float, default=1.0, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0')
+    parser.add_argument('--noise_type', type=str, default='normal', metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0')
 
     # MAGE params
     parser.add_argument('--mask_ratio_min', type=float, default=0.5,
@@ -67,8 +80,19 @@ def get_args_parser():
                         help='Gradient clip')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='./data/imagenet', type=str,
+    parser.add_argument('--data_path', default='../dataset/imagenet1k/train/', type=str,
                         help='dataset path')
+    parser.add_argument('--use_coco', default=False, action='store_true',
+                        help='dataset path')
+    # parser.add_argument('--forget_num', default=None, type=int,
+    #                     help='dataset path')
+    parser.add_argument('--opendata_to_forget_ratio', default=None, type=float,
+                        help='dataset path')
+    parser.add_argument('--num_image_per_class', default=120, type=int,
+                        help='dataset path')
+    parser.add_argument('--retainset_ratio', type=float, default=1.0, metavar='LR',
+                        help='lower lr bound for cyclic schedulers that hit 0')
+
 
     parser.add_argument('--output_dir', default='./output_dir',
                         help='path where to save, empty for no saving')
@@ -114,13 +138,49 @@ def main(args):
 
     cudnn.benchmark = True
 
+    # # simple augmentation
+    # transform_train = transforms.Compose([
+    #         transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0)),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor()])
+    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # print(dataset_train)
+
     # simple augmentation
-    transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0)),
+    if args.use_coco:
+        transform_train = transforms.Compose([
+            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 0.5), interpolation=3),
             transforms.RandomHorizontalFlip(),
-            transforms.ToTensor()])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+            transforms.ToTensor(),
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    if args.use_coco:
+        print('using mix_coco_imagenet_1k')
+        # raise NotImplementedError
+        dataset_train = dataset_class_img1k_coco(
+                                data_path = args.data_path, \
+                                num_image_per_class = args.num_image_per_class, \
+                                retain_ratio = args.retainset_ratio, \
+                                opendata_to_forget_ratio = args.opendata_to_forget_ratio, \
+                                transform_train = transform_train
+                                )
+    else:
+        print('using imagenet-1k only')
+        dataset_train = dataset_class_img1k_only(
+                                        data_path = args.data_path, \
+                                        num_image_per_class = args.num_image_per_class, \
+                                        retain_ratio = args.retainset_ratio, \
+                                        opendata_to_forget_ratio = args.opendata_to_forget_ratio, \
+                                        transform_train = transform_train
+                                    )
 
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
@@ -145,9 +205,20 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
-    
+
+
     # define the model
-    vqgan_ckpt_path = 'vqgan_jax_strongaug.ckpt'
+    vqgan_ckpt_path = 'pretrained/vqgan_jax_strongaug.ckpt'
+    if not os.path.isfile(vqgan_ckpt_path):
+        if misc.is_main_process():
+            os.system('gdown 13S_unB87n6KKuuMdyMnyExW0G1kplTbP')
+            os.system('mv vqgan_jax_strongaug.ckpt pretrained/')
+        vqgan_ckpt_path = 'pretrained/vqgan_jax_strongaug.ckpt'
+    if not os.path.isfile(args.resume):
+        if misc.is_main_process():
+            os.system('gdown 1Q6tbt3vF0bSrv5sPrjpFu8ksG3vTsVX2')
+            os.system('mv mage-vitb-1600.pth pretrained/')
+        args.resume = 'pretrained/mage-vitb-1600.pth'
 
     model = models_mage.__dict__[args.model](mask_ratio_mu=args.mask_ratio_mu, mask_ratio_std=args.mask_ratio_std,
                                              mask_ratio_min=args.mask_ratio_min, mask_ratio_max=args.mask_ratio_max,
@@ -181,8 +252,12 @@ def main(args):
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
+    teacher_model = copy.deepcopy(model)
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+
+    with open(os.path.join(args.output_dir, 'opt.yaml'), 'a+') as f:
+        json.dump(args.__dict__, f, indent=4)
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -190,16 +265,14 @@ def main(args):
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
-            args=args
+            teacher_model=teacher_model,
+            args=args,
         )
-        if args.output_dir and (epoch % 40 == 0 or epoch + 1 == args.epochs):
+        if args.output_dir:
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
-        misc.save_model_last(
-            args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-            loss_scaler=loss_scaler, epoch=epoch)
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         'epoch': epoch,}
 
@@ -208,7 +281,7 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
-
+        
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -217,6 +290,19 @@ def main(args):
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()
+    postfix = 'coco_' if args.use_coco else ''
+    postfix = 'coco_' if args.use_coco else ''
+    # if args.use_sagemaker:
+    #     args.output_dir = '/opt/ml/output/data/'+'class_img1k_{}_numimg_{}_{}_{}_ra_{}_fa_{}_l2wd_{}_dr_ratio_{}_open_{}_{}_'.format(postfix, args.num_image_per_class, args.opendata_to_forget_ratio, \
+    #                                 int(100*args.mask_ratio_mu), int(args.retain_alpha), int(100*args.forget_alpha), \
+    #                                 args.weight_decay, args.retainset_ratio, args.opendata_to_forget_ratio, args.noise_type)+str(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    #     args.data_path = '/opt/ml/input/data/'
+    # else:
+    # RC_TODO
+    args.output_dir  = args.output_dir + '/class_img1k_{}_numimg_{}_{}_{}_ra_{}_fa_{}_l2wd_{}_dr_ratio_{}_open_{}_{}_'.format(postfix, args.num_image_per_class, args.opendata_to_forget_ratio, \
+                                    int(100*args.mask_ratio_mu), int(args.retain_alpha), int(100*args.forget_alpha), \
+                                    args.weight_decay, args.retainset_ratio, args.opendata_to_forget_ratio, args.noise_type)+str(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     args.log_dir = args.output_dir
