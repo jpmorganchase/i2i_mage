@@ -31,8 +31,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('MAGE pre-training', add_help=False)
     parser.add_argument('--use_sagemaker', default=0, type=int,
                         help='using sagemaker or not')
-    parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--early_epochs', default=6, type=int)
+    parser.add_argument('--epochs', default=6, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
     parser.add_argument('--batch_size', default=32, type=int,
